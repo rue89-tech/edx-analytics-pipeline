@@ -221,3 +221,18 @@ class EventsPerCourseEventType(EventCounter):
             return None
 
         return course_id, event_type
+
+
+class ProblemCheckEventCount(EventCounter):
+
+    def get_grouping_key(self, line, event, date_string):
+        event_type = event.get('event_type')
+        event_source = event.get('event_source', '')
+
+        if event_type is None:
+            return None
+
+        if event_type == 'problem_check' and event_source == 'server':
+            return (date_string,)
+
+        return None
