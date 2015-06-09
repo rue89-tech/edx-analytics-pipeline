@@ -17,8 +17,11 @@ urllib3.contrib.pyopenssl.inject_into_urllib3()
 log = logging.getLogger(__name__)
 
 
-class PullFromPaypalTaskMixin(OverwriteOutputMixin):
+class PaypalTaskMixin(OverwriteOutputMixin):
 
+    start_date = luigi.DateParameter(
+        default_from_config={'section': 'paypal', 'name': 'start_date'}
+    )
     client_mode = luigi.Parameter(
         default_from_config={'section': 'paypal', 'name': 'client_mode'}
     )
@@ -31,22 +34,15 @@ class PullFromPaypalTaskMixin(OverwriteOutputMixin):
         default_from_config={'section': 'paypal', 'name': 'client_secret'},
         significant=False,
     )
+    run_date = luigi.DateParameter(default=datetime.datetime.utcnow().date())
 
 
-class SinglePullFromPaypalTask(PullFromPaypalTaskMixin, luigi.Task):
+class RawPaypalTransactionLogTask(PaypalTaskMixin, luigi.Task):
     """
     A task that reads out of a remote Paypal account and writes to a file in raw JSON lines format.
-
-    A complication is that this needs to be performed with more than one account.
-
-    Inputs also include the interval over which to request daily dumps.
-
-    Output should be incremental.  That is, this task can be run periodically with
-    contiguous time intervals requested, and the output should properly accumulate.
     """
 
     output_root = luigi.Parameter()
-    run_date = luigi.DateParameter(default=datetime.datetime.utcnow().date())
 
     def initialize(self):
         log.debug('Initializing paypalrestsdk')
@@ -63,7 +59,7 @@ class SinglePullFromPaypalTask(PullFromPaypalTaskMixin, luigi.Task):
 
         end_date = self.run_date + datetime.timedelta(days=1)
         request_args = {
-            'start_time': "{}T00:00:00Z".format(self.run_date.isoformat()),  # pylint: disable=no-member
+            'start_time': "{}T00:00:00Z".format(self.start_date.isoformat()),  # pylint: disable=no-member
             'end_time': "{}T00:00:00Z".format(end_date.isoformat()),
             'count': 20
         }
@@ -97,36 +93,71 @@ class SinglePullFromPaypalTask(PullFromPaypalTaskMixin, luigi.Task):
         pass
 
     def output(self):
-        url_with_filename = url_path_join(self.output_root, "paypal_{}.json".format(self.client_mode))
+        url_with_filename = url_path_join(self.output_root, 'paypal_transactions_{0}_{1}.json'.format(self.start_date.isoformat(), self.run_date.isoformat()))
         return get_target_from_url(url_with_filename)
 
 
-class IntervalPullFromPaypalTask(PullFromPaypalTaskMixin, luigi.Task):
-    """Determines a set of dates to pull, and requires them."""
+class PaypalTransactionsByDayTask(PaypalTaskMixin, luigi.Task):
 
-    interval = luigi.DateIntervalParameter()
     output_root = luigi.Parameter()
 
-    def requires(self):
-        args = {
-            'client_mode': self.client_mode,
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'output_root': self.output_root,
-            'overwrite': self.overwrite,
-        }
-        for current_date in self.interval:
-            date_string = current_date.strftime('%Y-%m-%d')  # pylint: disable=no-member
-            partition_path_spec = HivePartition('dt', date_string).path_spec
-            url_with_filename = url_path_join(self.output_root, partition_path_spec)
+    def run(self):
+        self.remove_output_on_overwrite()
+        if self.overwrite:
+            output_dir_target = get_target_from_url(url_path_join(self.output_root, 'daily') + '/')
+            output_dir_target.remove()
 
-            yield SinglePullFromPaypalTask(
-                client_mode=self.client_mode,
-                client_id=self.client_id,
-                client_secret=self.client_secret,
-                output_root=url_with_filename,
-                run_date=current_date,
-            )
+
+        output_files = {}
+
+        with self.input()[0].open('r') as input_file:
+            for line in input_file:
+                payment_record = json.loads(line)
+                for trans_with_items in payment_record.get('transactions', []):
+                    for transaction in trans_with_items.get('related_resources', []):
+                        trans_type = transaction.keys()[0]
+                        details = transaction[trans_type]
+                        if 'create_time' not in details:
+                            log.error('Expected field "create_time" not found in paypal transaction record: %s', line)
+                            continue
+                        created_date_string = details['create_time'].split('T')[0]
+
+                        output_file = output_files.get(created_date_string)
+                        if not output_file:
+                            target = get_target_from_url(url_path_join(self.output_root, 'daily', 'dt=' + created_date_string, 'paypal_transactions.json'))
+                            output_file = target.open('w')
+                            output_files[created_date_string] = output_file
+
+                        record = [
+                            created_date_string,
+                            payment_record['id'],
+                            payment_record['create_time'],
+                            payment_record['state'],
+                            trans_with_items['invoice_number'],
+                            trans_type,
+                            details['id'],
+                            details['create_time'],
+                            details['amount']['total'],
+                            details['amount']['currency'],
+                            details.get('transaction_fee', {}).get('value', '\\N'),
+                            details.get('transaction_fee', {}).get('currency', '\\N'),
+                            payment_record['payer']['payer_info']['payer_id'],
+                        ]
+                        output_file.write('\t'.join(record) + '\n')
+
+        for output_file in output_files.values():
+            output_file.close()
+
+        with self.output().open('w') as output_file:
+            output_file.write('OK')
+
+    def requires(self):
+        yield RawPaypalTransactionLogTask(
+            output_root=url_path_join(self.output_root, 'raw')
+        )
 
     def output(self):
-        return [task.output() for task in self.requires()]
+        url_with_filename = url_path_join(self.output_root, 'daily', '_SUCCESS')
+        return get_target_from_url(url_with_filename)
+
+
