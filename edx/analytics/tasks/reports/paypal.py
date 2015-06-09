@@ -6,7 +6,6 @@ import json
 
 from edx.analytics.tasks.url import get_target_from_url
 from edx.analytics.tasks.url import url_path_join
-from edx.analytics.tasks.util.hive import HivePartition
 from edx.analytics.tasks.util.overwrite import OverwriteOutputMixin
 
 # Tell urllib3 to switch the ssl backend to PyOpenSSL.
@@ -102,11 +101,10 @@ class PaypalTransactionsByDayTask(PaypalTaskMixin, luigi.Task):
     output_root = luigi.Parameter()
 
     def run(self):
-        self.remove_output_on_overwrite()
         if self.overwrite:
             output_dir_target = get_target_from_url(url_path_join(self.output_root, 'daily') + '/')
-            output_dir_target.remove()
-
+            if output_dir_target.exists():
+                output_dir_target.remove()
 
         output_files = {}
 
@@ -117,9 +115,6 @@ class PaypalTransactionsByDayTask(PaypalTaskMixin, luigi.Task):
                     for transaction in trans_with_items.get('related_resources', []):
                         trans_type = transaction.keys()[0]
                         details = transaction[trans_type]
-                        if 'create_time' not in details:
-                            log.error('Expected field "create_time" not found in paypal transaction record: %s', line)
-                            continue
                         created_date_string = details['create_time'].split('T')[0]
 
                         output_file = output_files.get(created_date_string)
